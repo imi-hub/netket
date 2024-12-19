@@ -115,10 +115,11 @@ def _apply_term_scan(x, weight, sites, daggers, unroll=1):
     not_zero = ~zero
     w_final = weight * not_zero * sign
     # return the xp, the mel and wether mel is zero
+
     return x_final, w_final, not_zero, sign
 
 
-@partial(jax.vmap, in_axes=(None, 0, 0, 0, None), out_axes=(-2, -1, -1))
+@partial(jax.vmap, in_axes=(None, 0, 0, 0, None), out_axes=(-2, -1, -1, -1))
 def _apply_terms_scan(x, w, sites, daggers, unroll):
     return _apply_term_scan(x, w, sites, daggers, unroll=unroll)
 
@@ -226,7 +227,7 @@ def _apply_term_scan_bits(
     return x_final.astype(x.dtype), w_final, not_zero, sign
 
 
-@partial(jax.vmap, in_axes=(None, 0, 0, 0, None, None, None), out_axes=(-2, -1, -1))
+@partial(jax.vmap, in_axes=(None, 0, 0, 0, None, None, None), out_axes=(-2, -1, -1, -1))
 def _apply_terms_scan_bits(x, w, sites, daggers, unroll, process, n_orbitals):
     return _apply_term_scan_bits(
         x, w, sites, daggers, unroll=unroll, process=process, n_orbitals=n_orbitals
@@ -282,7 +283,7 @@ def _apply_term_masks(x, w, sites, daggers):
     return x_final, w_final, d.prod(axis=-1)
 
 
-@partial(jax.vmap, in_axes=(None, 0, 0, 0), out_axes=(-2, -1, -1))
+@partial(jax.vmap, in_axes=(None, 0, 0, 0), out_axes=(-2, -1, -1, -1))
 def apply_terms_masks(x, w, sites, daggers):
     x_res, *res = _apply_term_masks(
         x.astype(np.int8), w, sites, daggers.astype(np.int8)
@@ -387,10 +388,10 @@ def _apply_term_only_masks(x, w, sites, daggers):
     # and jax would promote the result to float64
     w_final = w * (not_illegal * sgn).astype(w.dtype)
     # we assume w is not 0, otherwise we would have already removed it
-    return x_final, w_final, not_illegal, sign
+    return x_final, w_final, not_illegal, sgn
 
 
-@partial(jax.vmap, in_axes=(None, 0, 0, 0), out_axes=(-2, -1, -1))
+@partial(jax.vmap, in_axes=(None, 0, 0, 0), out_axes=(-2, -1, -1, -1))
 def apply_terms_only_masks(x, w, sites, daggers):
     # force cast to int8
     # x_res, *res = _apply_term_only_masks(x.astype(np.int8), w, sites, daggers.astype(np.int8))
@@ -418,9 +419,9 @@ def get_conn_padded_jax(
     if len(tl_diag) == 0 and len(tl_offdiag) == 0:
         xp = x[..., None, :][..., :0, :]
         mels = jnp.zeros(xp.shape[:-1], dtype=dtype)
-        signs = jnp.zeros(xp.shape[:-1], dtype=int8)
+        sign = jnp.zeros(xp.shape[:-1], dtype=np.int8)
         n_conn = np.zeros(mels.shape, dtype=int)
-        return xp, mels, n_conn, signs
+        return xp, mels, n_conn, sign
 
     if len(tl_diag) > 0:
         weight_dtype = tl_diag[-1][0].dtype
@@ -452,8 +453,7 @@ def get_conn_padded_jax(
             _, signs_, _, _ = apply_terms_fun(x, w, sites, daggers)
             mel_diag_ = mel_diag_ + mels_.sum(axis=-1, keepdims=True)
     # TODO here we could check if the diagonal is < cutoff and set nonzero_mask_ to False
-    signs_list.append(jnp.zeros(mel_diag_.shape,dtype=int8)) # diag signs always 1
-
+    signs_list.append(jnp.ones(mel_diag_.shape,dtype=np.int8)) # diag signs always 1
     xp_list.append(xp_diag_)
     mels_list.append(mel_diag_)
     nonzero_mask_list.append(nonzero_mask_)
@@ -464,17 +464,18 @@ def get_conn_padded_jax(
         mels_list.append(mels_)
         nonzero_mask_list.append(nonzero_mask_)
         signs_list.append(signs_)
-
     # pad with 0 and old state
     xp_list.append(x[..., None, :])
     mels_list.append(jnp.zeros((x.shape[:-1] + (1,)), dtype=weight_dtype))
-    signs_list.append(jnp.zeros((x.shape[:-1] + (1,)), dtype=int8))
+    signs_list.append(jnp.zeros((x.shape[:-1] + (1,)), dtype=np.int8)) # can also change to ones, mark padding with sign 0
+    
  
 
     xp_padded = jnp.concatenate(xp_list, axis=-2)
     mels_padded = jnp.concatenate(mels_list, axis=-1)
     signs_padded = jnp.concatenate(signs_list, axis=-1)
     nonzero_mask = jnp.concatenate(nonzero_mask_list, axis=-1)
+
 
     # move the nonzeros to the beginning
 
@@ -497,6 +498,7 @@ def get_conn_padded_jax(
     #
     # you should check that n_nonzero <= max_conn_size outside of jit,
     # and increase max_conn_size if it's not
+
     return xp_u, mels_u, n_nonzero, signs_u
 
 
@@ -645,7 +647,7 @@ class FermionOperator2ndJax(FermionOperator2ndBase, DiscreteJaxOperator):
         new_op._operators = self._operators.copy()
         return new_op
 
-    def get_conn_padded(self, x):
+    def get_conn_padded(self, x, return_sign=False):
         self._setup()
 
         if self._mode == "scan":
@@ -653,7 +655,7 @@ class FermionOperator2ndJax(FermionOperator2ndBase, DiscreteJaxOperator):
         elif self._mode == "mask":
             apply_terms_fun = apply_terms_masks
 
-        xp, mels, _, _ = get_conn_padded_jax(
+        xp, mels, _, sign = get_conn_padded_jax(
             self._max_conn_size,
             self._dtype,
             self._terms_list_diag,
@@ -669,6 +671,11 @@ class FermionOperator2ndJax(FermionOperator2ndBase, DiscreteJaxOperator):
         #     raise ValueError("more connected elements than _max_conn_size")
         #
         # alternatively we could return success
+        
+        if return_sign:
+            return xp, mels, sign
+        
+        
         return xp, mels
 
     def n_conn(self, x):
